@@ -21,6 +21,7 @@ import {
 import {
   intersect,
   lower,
+  normalizeLibraryName,
   normalizePath,
   normalizeVersion,
   refIdSet,
@@ -53,13 +54,18 @@ function bestLine(issue: RefinedIssue): number | undefined {
 
 function matchSca(a: RefinedIssue, b: RefinedIssue): TierMatch | null {
   const overlap = refIdsOverlap(a, b);
-  const libA = lower(a.library_name);
-  const libB = lower(b.library_name);
+  // Use ecosystem-stripped library names so PURL-style ("pkg/debian/bzip2")
+  // and bare names ("bzip2") collapse to the same package.
+  const libA = normalizeLibraryName(a.library_name);
+  const libB = normalizeLibraryName(b.library_name);
   const verA = normalizeVersion(a.current_version);
   const verB = normalizeVersion(b.current_version);
 
   const sameLib = libA && libB && libA === libB;
   const sameVer = verA && verB && verA === verB;
+  const scannerA = lower(a.product_name);
+  const scannerB = lower(b.product_name);
+  const crossScanner = scannerA && scannerB && scannerA !== scannerB;
 
   // T1 — exact: ref_id ∩ + library + version
   if (overlap.length > 0 && sameLib && sameVer) {
@@ -69,10 +75,12 @@ function matchSca(a: RefinedIssue, b: RefinedIssue): TierMatch | null {
         reference_identifiers: overlap,
         library_name: libA,
         current_version: verA,
+        ...(crossScanner ? { scanners: [scannerA, scannerB] } : {}),
       },
-      rationale:
-        `SCA T1 match: shared identifier ${overlap.join(", ")} on ` +
-        `${libA}@${verA}.`,
+      rationale: crossScanner
+        ? `SCA T1 cross-scanner match: ${scannerA} and ${scannerB} both reported ` +
+          `${overlap.join(", ")} on ${libA}@${verA}.`
+        : `SCA T1 match: shared identifier ${overlap.join(", ")} on ${libA}@${verA}.`,
     };
   }
   // T2 — version-loose: ref_id ∩ + library

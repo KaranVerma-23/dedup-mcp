@@ -20,6 +20,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { findDuplicateGroups } from "./tools/find-duplicate-groups.js";
 import { normalizeStoIssues } from "./tools/normalize-sto-issues.js";
+import { dedupePipeline } from "./tools/dedupe-pipeline.js";
 import { matchPair } from "./lib/tier-match.js";
 
 // ── shared input shape: a permissive RefinedIssue ──────────────────
@@ -88,6 +89,45 @@ function buildServer(): McpServer {
         issues: issues as any,
         group_threshold,
       });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "dedupe_pipeline",
+    "ONE-SHOT: fetch + (optionally enrich) + normalize + dedup STO issues. Scope is optional — pass pipeline_id, target_id, both (intersection), or neither (all-issues across the project, capped by max_issues). Returns only the small final summary (groups, headlines, suggested actions, timings) — large payloads stay inside dedup-mcp so the LLM never has to relay them. The `enrich` parameter controls per-issue detail fetching for the API backend ('auto' default = enrich only cross-scanner candidates; 'never' = fast list-only; 'always' = enrich every issue). The `backend` parameter selects how STO data is fetched: 'api' (default) uses the Harness STO REST API; 'sql' uses direct read-only Postgres against STO Core (~5-10x faster, includes per-occurrence file/line for SAST HIGH matching).",
+    {
+      pipeline_id: z.string().optional()
+        .describe("STO pipeline identifier. Optional."),
+      target_id: z.string().optional()
+        .describe("STO target identifier (repo/image/etc). Optional. Combine with pipeline_id for intersection filter; omit both to dedup across all-issues."),
+      project_id: z.string().describe("Harness project identifier"),
+      org_id: z.string().optional().describe("Harness org identifier (omit for default)"),
+      page_size: z.number().int().positive().max(100).optional()
+        .describe("STO API page size (max 100, default 100)"),
+      max_pages: z.number().int().positive().optional()
+        .describe("Max pages to fetch (API backend, defaults to ceil(max_issues/page_size))"),
+      max_issues: z.number().int().positive().max(5000).optional()
+        .describe("Hard cap on issues processed (default 1000). Bounds the O(N²) match step. Most-recent issues kept when truncated."),
+      group_threshold: z.enum(["HIGH","MEDIUM","LOW"]).optional()
+        .describe("Lowest tier to auto-group (default LOW — catches sibling-package fanout)"),
+      enrich: z.enum(["never","auto","always"]).optional()
+        .describe("Detail-enrichment mode (default 'auto'). API backend only. See tool description."),
+      backend: z.enum(["api","sql"]).optional()
+        .describe("Data source. 'api' (default, production-shaped) uses the Harness STO REST API. 'sql' uses direct read-only Postgres against STO Core; ~10x faster and includes per-occurrence file/line for SAST. SQL backend requires STO_DATABASE_URL env. Demo/QA only."),
+      sto_database_url: z.string().optional()
+        .describe("Override STO_DATABASE_URL for sql backend (Postgres connection string)."),
+      default_product_name: z.string().optional()
+        .describe("Fallback scanner name when STO API doesn't include one"),
+      harness_base_url: z.string().optional()
+        .describe("Override HARNESS_BASE_URL env (e.g. https://qa.harness.io)"),
+      harness_api_key: z.string().optional()
+        .describe("Override HARNESS_API_KEY env (Harness PAT)"),
+      harness_account_id: z.string().optional()
+        .describe("Override account id (otherwise parsed from PAT)"),
+    },
+    async (input) => {
+      const result = await dedupePipeline(input);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     },
   );

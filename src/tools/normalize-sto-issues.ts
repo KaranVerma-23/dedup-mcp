@@ -118,13 +118,18 @@ function normalizeRefId(raw: unknown): ReferenceIdentifier | undefined {
   return { type: type.toLowerCase(), id: id.toUpperCase() };
 }
 
-/** Where might a scanner name live in the API response. */
+/** Where might a scanner name live in the API response.
+ *  STO's issue-detail endpoint uses `scanTool` (e.g. "aqua-trivy",
+ *  "shiftleftsca"); the list endpoint omits scanner attribution entirely.
+ *  The dedupe_pipeline tool merges scanTool from the detail endpoint into
+ *  the raw issue before calling us, so we just need to find it wherever
+ *  STO put it. */
 function extractScannerName(o: Record<string, unknown>): string | undefined {
   return (
-    asString(o.product_name) ??       // sto_plugin shape
-    asString(o.productName) ??        // STO Core API camelCase
-    asString(o.scanTool) ??           // some endpoints
-    asString(o.scan_tool) ??
+    asString(o.scan_tool) ??          // detail-endpoint normalized into raw
+    asString(o.scanTool) ??           // detail endpoint camelCase
+    asString(o.product_name) ??       // sto_plugin RefinedIssue shape
+    asString(o.productName) ??        // STO Core API camelCase (older)
     asString((o as any).tool)
   );
 }

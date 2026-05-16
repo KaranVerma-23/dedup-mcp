@@ -6,179 +6,119 @@ agent:
         image: pkg.harness.io/vrvdt5ius7uwygso8s0bia/harness-agents/harness-ai-agent:latest
       with:
         task: |
-          You are the Harness Vulnerability Dedup agent. Your job is to find
-          all STO security issues for a given pipeline and group together
-          findings that refer to the same underlying vulnerability — the
-          messy clusters STO Core can't dedup at the storage layer (sibling
-          packages, version-family fanout, cross-scanner exact matches).
+          You are the Harness Vulnerability Dedup agent. Find STO security
+          issues for the given scope (pipeline, target, or both) and group
+          findings that refer to the same underlying vulnerability —
+          sibling packages, version-family fanout, cross-scanner exact
+          matches.
 
-          You are running autonomously inside a Harness pipeline step with no
-          human present. Complete all steps end-to-end without asking for
-          confirmation or input.
-
-          This is a READ-ONLY agent. Do NOT create exemptions, do NOT modify
-          any STO state. The output is structured JSON intended for
-          downstream consumers (the exemption-workflow agent + Slack).
+          You run autonomously inside a Harness pipeline step. Complete the
+          task end-to-end without asking for confirmation. This is a READ-ONLY
+          agent — do NOT create exemptions or modify STO state.
 
           ## Resolved Inputs
 
-            org_id:                <+inputs.orgId>
-            project_id:            <+inputs.projectId>
-            pipeline_id:           <+inputs.pipelineId>
-            page_size:             <+inputs.pageSize>
-            group_threshold:       <+inputs.groupThreshold>
-            default_product_name:  <+inputs.defaultProductName>
+            org_id:           <+inputs.orgId>
+            project_id:       <+inputs.projectId>
+            pipeline_id:      <+inputs.pipelineId>
+            target_id:        <+inputs.targetId>
+            group_threshold:  <+inputs.groupThreshold>
+            max_issues:       <+inputs.maxIssues>
 
-          ## Tooling
+          Scope is flexible:
+            - both pipeline_id and target_id set → intersection (most precise)
+            - one set, other empty → filter by that one
+            - BOTH empty → dedup across ALL issues in the project (capped by
+              max_issues — default 1000 — to keep the O(N²) match bounded)
 
-          You have two MCP servers available:
+          Pass whichever inputs are non-empty; OMIT empty ones from the tool call.
 
-            harness-mcp   — Harness platform access. Use `harness_list` with
-                            resource_type="security_issue" to fetch issues.
-            dedup-mcp     — Our custom deduplication tools:
-                              normalize_sto_issues  — converts raw STO API
-                                shape into the schema find_duplicate_groups
-                                expects. Always call this BEFORE dedup.
-                              find_duplicate_groups — clusters issues into
-                                duplicate groups with confidence tiers.
+          ## Workflow — single tool call
 
-          Pass project_id (and org_id when non-empty) to every harness_list
-          call to correctly scope the request. Do not use direct HTTP / curl.
+          Call the dedup-mcp `dedupe_pipeline` tool ONCE. It talks to the
+          STO backend (fetch + normalize + dedup) and keeps the large issue
+          payload inside the MCP server so you never have to relay it.
 
-          ## Workflow
-
-          ### Step 1 — Fetch issues for the pipeline (with pagination)
-
-          The STO API caps page_size at 100. To find duplicate clusters that
-          span pages (sibling-package CVE clusters often do), paginate up to
-          MAX_PAGES = 5 (i.e. up to 500 issues total).
-
-          Call repeatedly:
-            harness_list(
-              resource_type = "security_issue",
-              project_id    = <resolved project_id>,
-              org_id        = <resolved org_id>,        (omit if empty)
-              pipeline_ids  = <resolved pipeline_id>,
-              size          = 100,
-              page          = <page number, starting at 0>
+            dedupe_pipeline(
+              pipeline_id     = <resolved pipeline_id>,   (omit if empty)
+              target_id       = <resolved target_id>,     (omit if empty)
+              project_id      = <resolved project_id>,
+              org_id          = <resolved org_id>,        (omit if empty)
+              group_threshold = <resolved group_threshold, default "LOW">,
+              max_issues      = <resolved max_issues, default 1000>
             )
 
-          Stop when EITHER:
-            - You've fetched MAX_PAGES (5)
-            - The page returns fewer than 100 results
-            - pagination.totalPages says you're done
+          The tool returns the small final summary. Do NOT call harness_list,
+          normalize_sto_issues, or find_duplicate_groups separately — those
+          are the old slow path and force you to re-emit issues as text.
 
-          Note `pagination.totalItems` from the FIRST page for the summary.
-          Concatenate the `issues` arrays from every page into one list and
-          pass that single combined list into Step 2.
+          ## Step 2 — Emit the report
 
-          For very small pipelines (< 100 issues) one page is enough — don't
-          fetch additional pages just because MAX_PAGES allows it.
+          HARD RULES — non-negotiable:
+          1. Output the template below EXACTLY. NO extra prose. NO "Key
+             takeaway", NO "Note:", NO commentary, NO analysis, NO emojis,
+             NO ANSI/Unicode glyphs (logs strip them).
+          2. Plain text only. No tables, no markdown styling beyond the
+             section headers shown.
+          3. NO embedded JSON dump. NO trailing paragraphs.
+          4. If a tier is empty, print "(none)" — do NOT omit the section.
 
-          ### Step 2 — Normalize to RefinedIssue shape
+          SCOPE TEXT: choose ONE of these for the SCANNED line based on
+          which inputs were resolved (omit empties):
+            pipeline + target  → "pipeline=<pipeline_id> AND target=<target_id> (project=<project_id>, org=<org_id>)"
+            pipeline only      → "pipeline=<pipeline_id> (project=<project_id>, org=<org_id>)"
+            target only        → "target=<target_id> (project=<project_id>, org=<org_id>)"
+            neither            → "all issues in project=<project_id> (org=<org_id>)"
 
-          Pass the FULL raw response (whatever shape harness_list returned —
-          flat array, {data:[...]}, {content:[...]}, etc.) into:
-            dedup-mcp.normalize_sto_issues(
-              issues               = <the raw response from Step 1>,
-              default_product_name = <resolved default_product_name,
-                                      default "multi_scanner">
-            )
+          TEMPLATE (emit verbatim, substitute the bracketed values):
 
-          The tool extracts CVE / CWE / library / version / file from the
-          `title` field when the API doesn't return them as structured fields
-          (the compact list endpoint omits them — title parsing is how we
-          recover that data).
+          SCANNED: <scope text from above>
 
-          ### Step 3 — Find duplicate groups
+          METRICS:
+            input    : <total_items_on_pipeline> issues (<total_raw_occurrences> raw scanner findings)
+            output   : <unique_after_dedup> unique vulnerabilities
+            reduction: <noise_reduction_pct>% on our dedup, <end_to_end_noise_reduction_pct>% end-to-end
+            runtime  : <timings_ms.total / 1000, 2 dp> seconds
 
-          Call:
-            dedup-mcp.find_duplicate_groups(
-              issues          = <refined_issues from Step 2 output>,
-              group_threshold = <resolved group_threshold, default "LOW">
-            )
+          BUCKETS:
+            HIGH   (3+ scanners — auto-exempt): <H>
+            MEDIUM (2 scanners — review)      : <M>
+            LOW    (weak signal — manual)     : <L>
 
-          group_threshold="LOW" is the right default for SCA pipelines with
-          OS packages — sibling-package CVE clusters (e.g. libc6 + libc6-dev
-          + libc-bin all hit by the same CVE) collapse correctly. Use "HIGH"
-          for cross-scanner-exact-match-only mode.
+          HIGH ISSUE IDS:
+            <each group's primary_issue_id on its own line, indented 2 spaces>
+            <if H == 0, print "  (none)">
 
-          ### Step 4 — Emit the report
+          MEDIUM ISSUE IDS:
+            <each group's primary_issue_id on its own line, indented 2 spaces>
+            <if M == 0, print "  (none)">
 
-          Print a Markdown report in EXACTLY this format (designed to be
-          Slack-pasteable and human-readable, not engineer-jargon).
+          LOW ISSUE IDS:
+            <each group's primary_issue_id on its own line, indented 2 spaces>
+            <if L == 0, print "  (none)">
 
-          Use the `headline`, `suggested_action`, and `members` fields from
-          each duplicate_group — they're pre-formatted for human display.
-          DO NOT print raw `matched_signals` JSON or hash IDs in prose.
-
-          ## 🔎 Vulnerability Dedup — Pipeline `<pipeline_id>`
-
-          | Metric | Value |
-          |---|---|
-          | Total findings on pipeline | N (showed first M) |
-          | Duplicate groups found | N |
-          | Unique vulnerabilities after dedup | N |
-          | **Noise reduction** | **NN%** |
-
-          ---
-
-          ### 🚨 Top Duplicate Clusters
-
-          Sort groups by member count descending. For the top 10 (or all if
-          fewer), use this exact block per group:
-
-            **<index>. <group.headline>**
-            <if group has any "Critical" severity_code member: prepend "Severity: Critical">
-            ↳ Primary: <primary member's title — pull from members[where is_primary=true].title>
-            ↳ Affected: <comma-separated list of the OTHER members' library_name (or title if no library) — max 6, then "(+N more)">
-            ↳ Action: <group.suggested_action>
-
-          ---
-
-          ### 🟡 Possible Duplicates (Human Review)
-
-          If review_candidates is non-empty, summarize the first 5:
-
-            - <a's title> ↔ <b's title>: <one-sentence why>
-
-          If review_candidates is empty, write: "No human review needed —
-          all matches above auto-confidence threshold."
-
-          ---
-
-          ### 📊 Bottom Line
-
-          One sentence headline:
-            "**Collapsed N raw findings into M unique vulnerabilities — XX%
-            of developer ticket noise eliminated.** Largest single cluster:
-            <largest_group.headline>."
-
-          ### Step 5 — Emit machine-readable JSON
-
-          AFTER the Markdown report, emit a fenced JSON block with the
-          complete find_duplicate_groups output (so downstream agents like
-          the exemption-workflow can parse it):
-
-          ```json
-          { ...full output of find_duplicate_groups... }
-          ```
+          END OF TEMPLATE. Stop output here.
 
           ## Safety Rules
 
           - Never create exemptions. Never modify any STO state.
           - Never echo or log secret values, tokens, or credentials.
-          - If harness_list returns 0 issues, print "No issues found for
-            pipeline `<pipeline_id>` — nothing to dedup." and stop.
-          - If either MCP server is unreachable, fail with a precise error
-            message naming the unreachable server. Do NOT fall back to
-            scoring in your own reasoning.
-        max_turns: 30
+          - If the tool returns issue_count_sampled = 0, print
+            "No issues found for the given scope — nothing to dedup."
+            and stop.
+          - If the dedup-mcp server is unreachable, fail with a precise
+            error message naming the unreachable server. Do not fall back
+            to scoring in your own reasoning.
+        max_turns: 90
         mcp_format: harness
         mcp_servers: <+connectorInputs.resolveList(<+inputs.mcpConnectors>)>
       env:
         PLUGIN_HARNESS_CONNECTOR: <+inputs.llmConnector.id>
         ANTHROPIC_MODEL: <+inputs.modelName>
+        # NOTE: HARNESS_BASE_URL / HARNESS_API_KEY are NOT injected here.
+        # They live in the dedup-mcp shell (Option A) — set via .env or the
+        # serve-tunnel.sh invocation on the machine running dedup-mcp. The
+        # agent never sees the credential and has nothing to forward.
   inputs:
     llmConnector:
       type: connector
@@ -190,11 +130,9 @@ agent:
     mcpConnectors:
       type: array
       default:
-        # qa_harness_mcp = our cloudflared tunnel pointed at QA's harness-mcp
-        # (so we can scan QA-side STO findings from the devday agent runtime).
-        # Replace with `harness_mcp_server` if running against devday's own data.
-        - qa_harness_mcp
-        # vulnerability_dedup_mcp = our ngrok tunnel pointed at dedup-mcp.
+        # vulnerability_dedup_mcp = ngrok tunnel pointing at our dedup-mcp HTTP server.
+        # The new dedupe_pipeline tool calls the Harness STO API directly, so
+        # we no longer need harness-mcp in this agent — single MCP, one tool call.
         - vulnerability_dedup_mcp
       ui:
         component: array
@@ -202,7 +140,12 @@ agent:
           inputType: connector
     pipelineId:
       type: string
-      required: true
+      required: false
+      description: STO pipeline id. Optional. Combine with targetId for intersection. Omit both to dedup across all issues in the project.
+    targetId:
+      type: string
+      required: false
+      description: STO target id (a repo or container image). Optional. Combine with pipelineId for intersection. Omit both to dedup across all issues in the project.
     orgId:
       type: string
       default: default
@@ -210,12 +153,18 @@ agent:
       type: string
       required: true
       default: STO
-    pageSize:
-      type: string
-      default: "200"
     groupThreshold:
       type: string
       default: LOW
-    defaultProductName:
+      description: |
+        Lowest tier to surface as a duplicate_group. Default LOW so the
+        report shows HIGH (auto-exempt candidates), MEDIUM (review &
+        approve), and LOW (manual review). Set to HIGH to see only the
+        auto-exempt-ready groups.
+    maxIssues:
       type: string
-      default: multi_scanner
+      default: "1000"
+      description: |
+        Hard cap on issues processed (default 1000). Bounds the O(N²)
+        match step to ~1M comparisons (sub-second). Most-recent issues
+        are kept when truncated.

@@ -36,6 +36,9 @@ export interface GroupMember {
   severity_code?: string;
   library_name?: string;
   current_version?: string;
+  /** Scanner that reported this finding (e.g. "aqua-trivy", "shiftleftsca").
+   *  Only present when issue-detail enrichment ran — otherwise absent. */
+  scanner?: string;
   is_primary: boolean;
 }
 
@@ -169,6 +172,7 @@ export function findDuplicateGroups(input: FindGroupsInput): FindGroupsOutput {
         severity_code: issue?.severity_code,
         library_name: issue?.library_name,
         current_version: issue?.current_version,
+        scanner: issue?.product_name,
         is_primary: id === primaryId,
       };
     });
@@ -256,11 +260,16 @@ function buildHeadline(
   const cwes = uniqueRefIds(members, "cwe");
   const libs = uniqueLibraries(members);
   const versions = uniqueVersions(members);
+  const scanners = uniqueScanners(members);
   const n = members.length;
 
   // SCA case: shared CVE on packages (most common pattern)
   if (cves.length > 0) {
     const cveStr = cves.length === 1 ? cves[0] : `${cves[0]} (+${cves.length - 1} more)`;
+    // HIGH cross-scanner: same vuln + same package + same version, ≥2 scanners
+    if (tier === "HIGH" && scanners.length > 1 && libs.length === 1) {
+      return `${cveStr} on ${libs[0]}@${versions[0] ?? "?"} — reported by ${scanners.length} scanners (${scanners.join(", ")})`;
+    }
     if (libs.length > 1) {
       const libFamily = sharedPrefix(libs) || libs[0].split(/[-/_]/)[0];
       return `${cveStr} across ${n} sibling ${libFamily} packages`;
@@ -302,6 +311,11 @@ function buildHeadline(
 function buildSuggestedAction(members: RefinedIssue[], tier: Tier): string {
   const libs = uniqueLibraries(members);
   const versions = uniqueVersions(members);
+  const scanners = uniqueScanners(members);
+  // HIGH cross-scanner: prioritise this messaging — it's the strongest signal.
+  if (tier === "HIGH" && scanners.length > 1) {
+    return `Cross-scanner duplicate (${scanners.join(" + ")}) — same vuln on the same package. Keep the primary, exempt the ${members.length - 1} other(s) as confirmed duplicates.`;
+  }
   if (libs.length > 1) {
     return `Apply one component-level exemption — single fix to the parent library will resolve all ${members.length} sibling packages.`;
   }
@@ -309,9 +323,17 @@ function buildSuggestedAction(members: RefinedIssue[], tier: Tier): string {
     return `Same library affected at ${versions.length} versions — likely fixed by upgrading to a single safe version.`;
   }
   if (tier === "HIGH") {
-    return `Cross-scanner duplicate — keep the primary, exempt the others as duplicates.`;
+    return `High-confidence duplicate — keep the primary, exempt the others as duplicates.`;
   }
   return `Review and exempt the ${members.length - 1} duplicate(s) of the primary issue.`;
+}
+
+function uniqueScanners(issues: RefinedIssue[]): string[] {
+  const set = new Set<string>();
+  for (const i of issues) {
+    if (i.product_name) set.add(i.product_name);
+  }
+  return [...set];
 }
 
 function uniqueRefIds(issues: RefinedIssue[], type: "cve" | "cwe" | "ghsa"): string[] {
