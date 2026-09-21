@@ -33,8 +33,10 @@ export interface StoSqlFetchOptions {
    *  a "target", typically a repo or container image). When combined with
    *  pipeline_id, both filters apply (intersection). */
   target_id?: string;
-  /** Optional org/project filters (defensive — the pipeline_id is usually
-   *  globally unique within an account but we honor scope when given). */
+  /** Optional tenant filters. The QA DB is shared across many accounts;
+   *  filter by account_id to avoid mixing tenants when org/project names
+   *  collide (e.g. "default/STO" exists under several accounts). */
+  account_id?: string;
   org_id?: string;
   project_id?: string;
   /** Hard cap on returned issues. Default 1000 — keeps O(N²) match within
@@ -140,8 +142,15 @@ export async function fetchStoIssuesSql(
   //
   //   Without stage 2, PG had to aggregate every (issue, scan, occurrence)
   //   tuple across the entire project before the LIMIT could be applied.
-  const targetParamIdx = opts.target_id ? 4 : null;
-  const limitParamIdx = targetParamIdx ? 5 : 4;
+  // Param layout (fixed positions to keep the SQL stable):
+  //   $1 = pipeline_id (null = any)
+  //   $2 = org_id      (null = any)
+  //   $3 = project_id  (null = any)
+  //   $4 = account_id  (null = any)
+  //   $5 = target_id   (only included when JOIN target_variant is present)
+  //   $N = limit       (last)
+  const targetParamIdx = opts.target_id ? 5 : null;
+  const limitParamIdx = targetParamIdx ? 6 : 5;
 
   const sql = `
     WITH scope_scans AS (
@@ -154,6 +163,7 @@ export async function fetchStoIssuesSql(
         AND ($1::text IS NULL OR s.pipeline_id = $1)
         AND ($2::text IS NULL OR h.org_id = $2)
         AND ($3::text IS NULL OR h.project_id = $3)
+        AND ($4::text IS NULL OR s.account_id = $4)
         ${targetParamIdx ? `AND tv.target_id = $${targetParamIdx}` : ""}
     ),
     recent_issue_ids AS (
@@ -215,6 +225,7 @@ export async function fetchStoIssuesSql(
     opts.pipeline_id ?? null,
     opts.org_id ?? null,
     opts.project_id ?? null,
+    opts.account_id ?? null,
   ];
   if (opts.target_id) params.push(opts.target_id);
   // Fetch one extra row to detect if the result was capped.

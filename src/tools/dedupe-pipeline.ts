@@ -154,6 +154,9 @@ export async function dedupePipeline(
       database_url: trim(input.sto_database_url) ?? trim(process.env.STO_DATABASE_URL),
       pipeline_id: input.pipeline_id,
       target_id: input.target_id,
+      // The QA DB is multi-tenant — passing account_id ensures we only see
+      // rows for the requested account even when org/project names collide.
+      account_id: trim(input.harness_account_id) ?? trim(process.env.HARNESS_ACCOUNT_ID),
       org_id: input.org_id,
       project_id: input.project_id,
       max_issues: maxIssues,

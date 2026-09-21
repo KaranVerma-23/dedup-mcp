@@ -18,6 +18,7 @@ agent:
 
           ## Resolved Inputs
 
+            account_id:       <+inputs.accountId>
             org_id:           <+inputs.orgId>
             project_id:       <+inputs.projectId>
             pipeline_id:      <+inputs.pipelineId>
@@ -40,13 +41,21 @@ agent:
           payload inside the MCP server so you never have to relay it.
 
             dedupe_pipeline(
-              pipeline_id     = <resolved pipeline_id>,   (omit if empty)
-              target_id       = <resolved target_id>,     (omit if empty)
-              project_id      = <resolved project_id>,
-              org_id          = <resolved org_id>,        (omit if empty)
-              group_threshold = <resolved group_threshold, default "LOW">,
-              max_issues      = <resolved max_issues, default 1000>
+              pipeline_id        = <resolved pipeline_id>,   (omit if empty)
+              target_id          = <resolved target_id>,     (omit if empty)
+              project_id         = <resolved project_id>,
+              org_id             = <resolved org_id>,        (omit if empty)
+              harness_account_id = <resolved account_id>,    (omit if empty)
+              backend            = "sql",
+              group_threshold    = <resolved group_threshold, default "LOW">,
+              max_issues         = <resolved max_issues, default 1000>
             )
+
+          ALWAYS pass backend = "sql". The SQL path talks directly to the
+          STO database and respects the harness_account_id filter, so it
+          works for ANY account/org/project (not just the one tied to the
+          server's PAT). The "api" backend would 401 against accounts the
+          PAT can't reach.
 
           The tool returns the small final summary. Do NOT call harness_list,
           normalize_sto_issues, or find_duplicate_groups separately — those
@@ -64,7 +73,8 @@ agent:
           4. If a tier is empty, print "(none)" — do NOT omit the section.
 
           SCOPE TEXT: choose ONE of these for the SCANNED line based on
-          which inputs were resolved (omit empties):
+          which inputs were resolved (omit empties). If account_id is
+          present, append " account=<account_id>" inside the parens.
             pipeline + target  → "pipeline=<pipeline_id> AND target=<target_id> (project=<project_id>, org=<org_id>)"
             pipeline only      → "pipeline=<pipeline_id> (project=<project_id>, org=<org_id>)"
             target only        → "target=<target_id> (project=<project_id>, org=<org_id>)"
@@ -85,17 +95,24 @@ agent:
             MEDIUM (2 scanners — review)      : <M>
             LOW    (weak signal — manual)     : <L>
 
-          HIGH ISSUE IDS:
-            <each group's primary_issue_id on its own line, indented 2 spaces>
+          HIGH ISSUES:
+            <each group on its own line, indented 2 spaces, format:>
+            <primary_issue_id> : <primary member title>
             <if H == 0, print "  (none)">
 
-          MEDIUM ISSUE IDS:
-            <each group's primary_issue_id on its own line, indented 2 spaces>
+          MEDIUM ISSUES:
+            <each group on its own line, indented 2 spaces, format:>
+            <primary_issue_id> : <primary member title>
             <if M == 0, print "  (none)">
 
-          LOW ISSUE IDS:
-            <each group's primary_issue_id on its own line, indented 2 spaces>
+          LOW ISSUES:
+            <each group on its own line, indented 2 spaces, format:>
+            <primary_issue_id> : <primary member title>
             <if L == 0, print "  (none)">
+
+          The "primary member title" is the title field of the member whose
+          is_primary=true (or members[0] if none flagged primary). Keep it
+          verbatim — do NOT truncate, paraphrase, or annotate.
 
           END OF TEMPLATE. Stop output here.
 
@@ -138,6 +155,15 @@ agent:
         component: array
         input:
           inputType: connector
+    accountId:
+      type: string
+      required: false
+      description: |
+        Harness account id. Optional. When set, scopes the SQL query to this
+        account — important for QA where the DB is multi-tenant and the same
+        (org, project) names exist under several accounts. If omitted, the
+        query runs across whatever accounts match (org, project). For
+        production a customer would always set this to their account.
     pipelineId:
       type: string
       required: false
